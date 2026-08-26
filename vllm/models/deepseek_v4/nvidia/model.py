@@ -1322,6 +1322,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             requires_grad=False,
         )
         spec_config = vllm_config.speculative_config
+        self._capture_final_aux_hc_head = (
+            spec_config is not None and spec_config.uses_extract_hidden_states()
+        )
         needs_mtp_hidden_states = spec_config is not None and (
             spec_config.use_eagle() or spec_config.uses_draft_model()
         )
@@ -1389,6 +1392,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         residual, post_mix, res_mix = None, None, None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
+        final_aux_index: int | None = None
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -1411,6 +1415,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)
                 final_aux_recon = aux_recon
+                if self._capture_final_aux_hc_head and idx + 1 == self.end_layer:
+                    final_aux_index = len(aux_hidden_states) - 1
         if layer is not None:
             # Reuse if the last layer was captured as an aux hidden state
             if self.end_layer in self.aux_hidden_state_layers:
@@ -1438,6 +1444,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.rms_norm_eps,
             self.hc_eps,
         )
+        if final_aux_index is not None:
+            aux_hidden_states[final_aux_index] = hidden_states.clone()
         hidden_states = self.norm(hidden_states)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
