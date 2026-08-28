@@ -66,6 +66,7 @@ def _convert_req_index_to_global_index_kernel(
     ti_stride1,
     out_stride0,
     out_stride1,
+    INVALID_FILL: tl.constexpr = -1,
 ):
     # program_id(0) -> token_id (row)
     # program_id(1) -> tile index along columns
@@ -118,7 +119,7 @@ def _convert_req_index_to_global_index_kernel(
         )
         prefill_out = workspace_start + tok
         out_val = tl.where(is_prefill, prefill_out, out_val)
-    out_val = tl.where(is_invalid_tok, -1, out_val)
+    out_val = tl.where(is_invalid_tok, INVALID_FILL, out_val)
 
     if COMPACT_TO_FRONT:
         # Scatter valid slots to a contiguous prefix. A per-tile exclusive prefix
@@ -186,6 +187,9 @@ def triton_convert_req_index_to_global_index(
     prefill_workspace_request_ids: torch.Tensor | None = None,
     prefill_workspace_starts: torch.Tensor | None = None,
     return_valid_counts: bool = False,
+    out: torch.Tensor | None = None,
+    valid_counts_out: torch.Tensor | None = None,
+    invalid_fill: int = -1,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     out[token_id, indice_id] =
@@ -193,9 +197,20 @@ def triton_convert_req_index_to_global_index(
             token_indices[token_id, indice_id] // BLOCK_SIZE] * BLOCK_SIZE
         + token_indices[token_id, indice_id] % BLOCK_SIZE
 
-    Only when token_indices[token_id, indice_id] == -1 do we output -1.
-    For safety, we also output -1 if the derived block_id would be
-        out-of-bounds.
+    Only when token_indices[token_id, indice_id] == -1 do we output
+    ``invalid_fill``. For safety, we also output ``invalid_fill`` if the
+    derived block_id would be out-of-bounds.
+
+    ``invalid_fill`` defaults to the legacy -1 sentinel. Passing 0 keeps every
+    slot a real, in-bounds physical index, so a consumer kernel that
+    speculatively dereferences slots beyond a row's valid count never reads a
+    wild address; the per-row valid count still bounds the semantically live
+    prefix, which stays front-packed exactly when the input's valid entries
+    are front-packed.
+
+    ``out`` and ``valid_counts_out`` let the caller own the output storage
+    (e.g. slices of a persistent arena, so reads past the live region land in
+    owned memory). When omitted, fresh exact-size tensors are allocated.
 
     When HAS_PREFILL_WORKSPACE is True, prefill tokens are mapped to workspace offsets
     instead of global cache slots. prefill_workspace_request_ids and
@@ -239,13 +254,27 @@ def triton_convert_req_index_to_global_index(
     req_id_c = req_id.contiguous()
     block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
-    out = torch.empty_like(token_indices_c)
+    if out is None:
+        out = torch.empty_like(token_indices_c)
+    else:
+        assert out.dtype == torch.int32
+        assert out.shape == token_indices_c.shape
+        assert out.device == token_indices_c.device
 
     valid_counts: torch.Tensor | None = None
     if return_valid_counts:
-        # Zero-init only matters for the atomic accumulation path.
-        alloc = torch.empty if single_tile else torch.zeros
-        valid_counts = alloc(num_tokens, dtype=torch.int32, device=token_indices.device)
+        if valid_counts_out is not None:
+            assert valid_counts_out.dtype == torch.int32
+            assert valid_counts_out.shape == (num_tokens,)
+            valid_counts = valid_counts_out
+            if not single_tile:
+                valid_counts.zero_()
+        else:
+            # Zero-init only matters for the atomic accumulation path.
+            alloc = torch.empty if single_tile else torch.zeros
+            valid_counts = alloc(
+                num_tokens, dtype=torch.int32, device=token_indices.device
+            )
 
     # Strides in elements
     bt_stride0, bt_stride1 = block_table_c.stride()
@@ -290,6 +319,7 @@ def triton_convert_req_index_to_global_index(
         ti_stride1,
         out_stride0,
         out_stride1,
+        INVALID_FILL=invalid_fill,
         num_warps=num_warps,
     )
 

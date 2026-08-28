@@ -295,6 +295,66 @@ def _get_workspace_buffer(device: torch.device) -> torch.Tensor:
     return _fi_sparse_workspace
 
 
+_fi_sparse_indices_arena: torch.Tensor | None = None
+_fi_sparse_counts_arena: torch.Tensor | None = None
+_fi_sparse_counter_buffer: torch.Tensor | None = None
+
+
+def _get_sparse_metadata_arenas(
+    max_num_tokens: int, topk: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Persistent zero-initialized arenas for converted sparse-attention
+    metadata (physical top-k indices and per-token valid counts).
+
+    The trtllm-gen sparse MLA kernel family is documented (flashinfer #4671)
+    to read metadata past the live region under some launch shapes. Writing
+    each step's metadata into slices of one persistent arena guarantees such
+    reads land in owned memory holding bounded values, instead of past a
+    fresh exact-size allocation where the adjacent bytes are allocator luck.
+    Shared across layers like the workspace buffer: attention launches are
+    serialized on the model stream, and each layer's converter writes the
+    arena before its kernel reads it.
+    """
+    global _fi_sparse_indices_arena, _fi_sparse_counts_arena
+    if (
+        _fi_sparse_indices_arena is None
+        or _fi_sparse_indices_arena.shape[0] < max_num_tokens
+        or _fi_sparse_indices_arena.shape[1] != topk
+    ):
+        _fi_sparse_indices_arena = torch.zeros(
+            max_num_tokens, topk, dtype=torch.int32, device=device
+        )
+        _fi_sparse_counts_arena = torch.zeros(
+            max_num_tokens, dtype=torch.int32, device=device
+        )
+    assert _fi_sparse_counts_arena is not None
+    return _fi_sparse_indices_arena, _fi_sparse_counts_arena
+
+
+def _get_sparse_counter_buffer(
+    max_num_tokens: int, num_heads: int, device: torch.device
+) -> torch.Tensor:
+    """Persistent zero-initialized multi-CTA KV counter buffer, sized once for
+    the worst-case launch. Passing it to flashinfer replaces the per-call
+    allocation flagged in flashinfer #4671 (buffer-lifetime hazard under
+    graph capture); the kernel self-resets the counters after every launch.
+    """
+    global _fi_sparse_counter_buffer
+    if _fi_sparse_counter_buffer is None:
+        from flashinfer.utils import (
+            get_device_sm_count,
+            get_trtllm_gen_multi_ctas_kv_counter_bytes,
+        )
+
+        counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            max_num_tokens, num_heads, get_device_sm_count(device)
+        )
+        _fi_sparse_counter_buffer = torch.zeros(
+            counter_bytes, dtype=torch.uint8, device=device
+        )
+    return _fi_sparse_counter_buffer
+
+
 class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
     """FlashInfer MLA Sparse implementation.
 
@@ -377,6 +437,12 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
+        indices_arena, counts_arena = _get_sparse_metadata_arenas(
+            self.topk_indices_buffer.shape[0],
+            self.topk_indices_buffer.shape[1],
+            q.device,
+        )
+
         if self.dcp_world_size > 1:
             topk_indices_physical, seq_lens = triton_filter_and_convert_dcp_index(
                 attn_metadata.req_id_per_token[:num_actual_toks],
@@ -397,6 +463,9 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 BLOCK_SIZE=attn_metadata.block_size,
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
                 return_valid_counts=True,
+                out=indices_arena[:num_actual_toks],
+                valid_counts_out=counts_arena[:num_actual_toks],
+                invalid_fill=0,
             )
 
         if self._workspace_buffer is None:
@@ -436,6 +505,9 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             bmm2_scale=self.bmm2_scale,
             sparse_mla_top_k=attn_metadata.topk_tokens,
             return_lse=self.need_to_return_lse_for_decode,
+            multi_ctas_kv_counter_buffer=_get_sparse_counter_buffer(
+                self.topk_indices_buffer.shape[0], q.shape[1], q.device
+            ),
         )
         if self.need_to_return_lse_for_decode:
             assert isinstance(kernel_out, tuple)
@@ -448,7 +520,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         out = o.view(-1, o.shape[-2], o.shape[-1])
         if lse is not None:
             lse = self._normalize_lse(lse, out.shape[0], out.shape[1])
-            empty_rows = (topk_indices_physical == -1).all(dim=-1)
+            empty_rows = seq_lens == 0
             out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
             lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
         return out, lse
