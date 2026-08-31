@@ -1280,7 +1280,16 @@ def _get_per_layer_spec(
 def _get_kv_cache_bytes_per_block(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
-    """Return the largest cache group's bytes per block."""
+    """Return the largest cache group's bytes per block, padded to every
+    member spec's declared row alignment.
+
+    In block-outermost layouts this value becomes each layer view's block
+    stride, and MLA sparse kernels require that stride to be a multiple of
+    their tensormap row (FlashMLA sparse decode asserts stride % alignment
+    == 0). Individual MLA pages are already alignment-padded, but a group
+    whose specs carry no alignment (e.g. hidden-state cache layers) can set
+    the max and break the contract for every other layer.
+    """
     bytes_per_block = max(
         sum(
             _get_per_layer_spec(group, layer_name).page_size_bytes
@@ -1289,6 +1298,18 @@ def _get_kv_cache_bytes_per_block(
         for group in kv_cache_groups
     )
     assert bytes_per_block > 0
+    alignments = {
+        alignment
+        for group in kv_cache_groups
+        for layer_name in group.layer_names
+        if (
+            alignment := getattr(
+                _get_per_layer_spec(group, layer_name), "alignment", None
+            )
+        )
+    }
+    if alignments:
+        bytes_per_block = round_up(bytes_per_block, math.lcm(*alignments))
     return bytes_per_block
 
 
